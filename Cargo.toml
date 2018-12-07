@@ -1,0 +1,8 @@
+[package]
+name = "fluidsim"
+version = "0.1.0"
+authors = ["Cole Miles <cm3uc@virginia.edu>"]
+
+[dependencies]
+glium = "*"
+nalgebra = "0.16.4"
