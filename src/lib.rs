@@ -18,15 +18,17 @@ pub struct Force {
 }
 
 pub struct FluidGrid {
-    pub vx: Vec<f32>,       // x velocity at each grid point
+    pub vx: Vec<f32>,                   // x velocity at each grid point
     pub old_vx: Vec<f32>,
-    pub vy: Vec<f32>,       // y velocity at each grid point
+    pub vy: Vec<f32>,                   // y velocity at each grid point
     pub old_vy: Vec<f32>,
-    pub rho: Vec<f32>,      // current density at each grid point
-    pub old_rho: Vec<f32>,  // previous density at each grid point
-    pub nx: usize,          // number of grid points in x (inc. boundary points)
-    pub ny: usize,          // number of grid points in y (inc. boundary points)
-    walls: Vec<bool>        // boolean mask which shows where walls are
+    pub rho: Vec<f32>,                  // current density at each grid point
+    pub old_rho: Vec<f32>,              // previous density at each grid point
+    pub nx: usize,                      // number of grid points in x (inc. boundary points)
+    pub ny: usize,                      // number of grid points in y (inc. boundary points)
+    walls: Vec<bool>,                   // boolean mask which shows where walls are
+    no_vert_cells: Vec<(usize, usize)>, // cells where vertical velocity should be zeroed
+    no_hori_cells: Vec<(usize, usize)>, // cells where horizontal velocity should be zeroed
 }
 
 // Simulation box -- currently restricted to be a square
@@ -40,6 +42,8 @@ impl FluidGrid {
             rho: vec![0.0; (size+2) * (size+2)],
             old_rho: vec![0.0; (size+2) * (size+2)],
             walls: vec![false; (size+2) * (size+2)],
+            no_vert_cells: Vec::new(),
+            no_hori_cells: Vec::new(),
             nx: size+2,
             ny: size+2
         }
@@ -49,23 +53,42 @@ impl FluidGrid {
             Some(r) => add_source(&mut self.rho, r, 1.0, dt),
             None => (),
         };
-        diffuse(&mut self.rho, &self.old_rho, self.nx, diff, dt, true);
+        let N = self.nx;
+        let rho_bdy_conds = |field: &mut Vec<f32>| {
+            open_bdy_conds(field, N);
+            flow_bdy_conds(field, N);
+        };
+        diffuse(&mut self.rho, &self.old_rho, self.nx, diff, dt, rho_bdy_conds);
         mem::swap(&mut self.rho, &mut self.old_rho);
-        advect(&mut self.rho, &self.old_rho, &self.vx, &self.vy, self.nx, dt, true);
+        advect(&mut self.rho, &self.old_rho, &self.vx, &self.vy, self.nx, dt, rho_bdy_conds);
         mem::swap(&mut self.rho, &mut self.old_rho);
     }
 
     pub fn vel_step(&mut self, force: Option<Force>, visc: f32, dt: f32) {
         mem::swap(&mut self.vx, &mut self.old_vx);
         mem::swap(&mut self.vy, &mut self.old_vy);
-        diffuse(&mut self.vx, &self.old_vx, self.nx, visc, dt, true);
-        diffuse(&mut self.vy, &self.old_vy, self.ny, visc, dt, false);
+        let N = self.nx;
+        let vx_bdy_conds = |field: &mut Vec<f32>| {
+            open_bdy_conds(field, N);
+            flow_bdy_conds(field, N);
+        };
+        let vy_bdy_conds = |field: &mut Vec<f32>| {
+            open_bdy_conds(field, N);
+        };
+        diffuse(&mut self.vx, &self.old_vx, self.nx, visc, dt, vx_bdy_conds);
+        zero_bdy_conds(&mut self.vx, &self.no_hori_cells, self.nx);
+        diffuse(&mut self.vy, &self.old_vy, self.ny, visc, dt, vy_bdy_conds);
+        zero_bdy_conds(&mut self.vy, &self.no_vert_cells, self.nx);
         project(&mut self.vx, &mut self.vy, &mut self.old_vx, &mut self.old_vy, self.nx);
         mem::swap(&mut self.vx, &mut self.old_vx);
         mem::swap(&mut self.vy, &mut self.old_vy);
-        advect(&mut self.vx, &self.old_vx, &self.old_vx, &self.old_vy, self.nx, dt, true);
-        advect(&mut self.vy, &self.old_vy, &self.old_vx, &self.old_vy, self.nx, dt, false);
+        advect(&mut self.vx, &self.old_vx, &self.old_vx, &self.old_vy, self.nx, dt, vx_bdy_conds);
+        zero_bdy_conds(&mut self.vx, &self.no_hori_cells, self.nx);
+        advect(&mut self.vy, &self.old_vy, &self.old_vx, &self.old_vy, self.nx, dt, vy_bdy_conds);
+        zero_bdy_conds(&mut self.vy, &self.no_vert_cells, self.nx);
         project(&mut self.vx, &mut self.vy, &mut self.old_vx, &mut self.old_vy, self.nx);
+        zero_bdy_conds(&mut self.vx, &self.no_hori_cells, self.nx);
+        zero_bdy_conds(&mut self.vy, &self.no_vert_cells, self.nx);
     }
 
     pub fn test_init(&mut self) {
@@ -94,8 +117,13 @@ impl FluidGrid {
                 let ind = i * self.nx + j;
                 self.walls[ind] = true;
             }
+            self.no_hori_cells.push((start_ind-1, i));
+            self.no_hori_cells.push((end_ind, i));
+            self.no_vert_cells.push((i, start_ind-1));
+            self.no_vert_cells.push((i, end_ind));
         }
     }
+
 }
 
 fn add_source(field: &mut Vec<f32>, rect: Rect, rate: f32, dt: f32) {
@@ -108,29 +136,27 @@ fn add_source(field: &mut Vec<f32>, rect: Rect, rate: f32, dt: f32) {
     }
 }
 
-// Gauss-Seidel relaxation of diffusion term
-// If flow is set, then this is a field which needs the flow boundary conditions on it
-// (Gross, I know...)
-pub fn diffuse(field: &mut Vec<f32>, old_field: &Vec<f32>, N: usize, diff: f32, dt: f32, flow: bool) {
-    let gam: f32 = dt * diff * N as f32 * N as f32;
+// gauss-seidel relaxation of diffusion term
+// bdy_conds is a closure which imposes boundary conditions
+pub fn diffuse<F>(field: &mut Vec<f32>, old_field: &Vec<f32>, n: usize, diff: f32, dt: f32, bdy_conds: F) 
+where F: Fn(&mut Vec<f32>) {
+    let gam: f32 = dt * diff * n as f32 * n as f32;
     for k in 0..20 {
-        for i in 1..N-1 {
-            for j in 1..N-1 {
-                let ind = N * i + j;
+        for i in 1..n-1 {
+            for j in 1..n-1 {
+                let ind = n * i + j;
                 field[ind] = (old_field[ind] +
-                    gam * (field[ind - 1] + field[ind + 1] + field[ind - N] +
-                           field[ind + N])) / (1.0 + 4.0 * gam);
+                    gam * (field[ind - 1] + field[ind + 1] + field[ind - n] +
+                           field[ind + n])) / (1.0 + 4.0 * gam);
             }
         }
-        open_bdy_conds(field, N);
-        if flow {
-            flow_bdy_conds(field, N);
-        }
+        bdy_conds(field);
     }
 }
 
-pub fn advect(field: &mut Vec<f32>, old_field: &Vec<f32>, 
-              velx: &Vec<f32>, vely: &Vec<f32>, N: usize, dt: f32, flow: bool) {
+pub fn advect<F>(field: &mut Vec<f32>, old_field: &Vec<f32>, 
+                 velx: &Vec<f32>, vely: &Vec<f32>, N: usize, dt: f32, bdy_conds: F)
+where F: Fn(&mut Vec<f32>) {
     let fsize = N as f32;
     let gam = dt * fsize;
     for i in 1..N-1 {
@@ -160,14 +186,11 @@ pub fn advect(field: &mut Vec<f32>, old_field: &Vec<f32>,
                                t1 * old_field[N * (i0 + 1) + j0 + 1]);
         }
     }
-    open_bdy_conds(field, N);
-    if flow {
-        flow_bdy_conds(field, N);
-    }
+    bdy_conds(field);
 }
 
 pub fn project(velx: &mut Vec<f32>, vely: &mut Vec<f32>, 
-           p: &mut Vec<f32>, div: &mut Vec<f32>, N: usize) {
+               p: &mut Vec<f32>, div: &mut Vec<f32>, N: usize) {
     let dx = 1.0 / N as f32;
     for i in 1..N-1 {
         for j in 1..N-1 {
@@ -225,6 +248,14 @@ fn flow_bdy_conds(field: &mut Vec<f32>, N: usize) {
     let dx = 1.0 / (N - 1) as f32;
     for j in start_ind..end_ind {
         field[j] = 5.0 * (PI * dx * (j - start_ind) as f32 / (((end_ind - start_ind) as f32) * dx)).sin();
+    }
+}
+
+// Zero out compnents of a field at cells given by inds
+fn zero_bdy_conds(field: &mut Vec<f32>, zeros: &Vec<(usize, usize)>, N: usize) {
+    for (i, j) in zeros.iter() {
+        let ind = N * i + j;
+        field[ind] = 0.0;
     }
 }
 
@@ -311,4 +342,33 @@ pub fn gen_density_verts(fluidgrid: &FluidGrid) -> (Vec<DensityVert>, Vec<u32>) 
         }
     }
     (density_verts, indices)
+}
+
+// Generates a Vec of vertices that can be fed to the shaders for drawing the
+//  walls. Just generate two triangles that form the cell box for each one.
+pub fn gen_wall_verts(fluidgrid: &FluidGrid) -> (Vec<WallVert>, Vec<u32>) {
+    let mut wall_verts: Vec<WallVert> = Vec::new();
+    let mut indices: Vec<u32> = Vec::new();
+    let mut cur_ind = 0;
+    let dx = 2.0 / (fluidgrid.nx as f32 - 2.0);
+    for i in 0..fluidgrid.nx {
+        for j in 0..fluidgrid.ny {
+            let ind = fluidgrid.ny * i + j;
+            if fluidgrid.walls[ind] {
+                let botleft = [-1.0 + (i - 1) as f32 * dx, -1.0 + (j - 1) as f32 * dx];
+                wall_verts.push(WallVert{pos: botleft});
+                wall_verts.push(WallVert{pos: [botleft[0] + dx, botleft[1]]});
+                wall_verts.push(WallVert{pos: [botleft[0], botleft[1] + dx]});
+                wall_verts.push(WallVert{pos: [botleft[0] + dx, botleft[1] + dx]});
+                indices.push(cur_ind);
+                indices.push(cur_ind+1);
+                indices.push(cur_ind+3);
+                indices.push(cur_ind);
+                indices.push(cur_ind+2);
+                indices.push(cur_ind+3);
+                cur_ind += 4;
+            }
+        }
+    }
+    (wall_verts, indices)
 }
